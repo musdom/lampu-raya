@@ -12,6 +12,7 @@
 // display
 #define TFT_X 240
 #define TFT_Y 280
+#define BACKLIGHT_PIN 1
 #define TFT_ROTATION 0
 #define DISPLAY_SLEEP_TIMEOUT_MS (5UL * 60UL * 1000UL)
 #define DISPLAY_BACKLIGHT_ON_LEVEL 127
@@ -30,7 +31,10 @@
 #define MAX_LEDS 600
 #define DEFAULT_LED_COUNT 300
 #define LED_FPS 120
-#define PATTERN_SWITCH_MS 10000
+#define DEFAULT_PATTERN_SWITCH_MS 10000
+#define MIN_PATTERN_SWITCH_SECONDS 1
+#define MAX_PATTERN_SWITCH_SECONDS 600
+#define PATTERN_COUNT 6
 
 // Touch orientation tuning.
 #define TOUCH_SWAP_XY 0
@@ -63,6 +67,9 @@ static lv_obj_t *settings_page = nullptr;
 static lv_obj_t *schedule_page = nullptr;
 static lv_obj_t *schedule_edit_page = nullptr;
 static lv_obj_t *led_strip_page = nullptr;
+static lv_obj_t *led_strip_count_page = nullptr;
+static lv_obj_t *led_strip_pattern_time_page = nullptr;
+static lv_obj_t *led_strip_patterns_page = nullptr;
 static lv_obj_t *clock_dialog = nullptr;
 static lv_obj_t *clock_title_label = nullptr;
 static lv_obj_t *clock_hour_spin = nullptr;
@@ -99,11 +106,16 @@ static lv_obj_t *schedule_range1_end_btn = nullptr;
 static lv_obj_t *schedule_range1_start_time_label = nullptr;
 static lv_obj_t *schedule_range1_end_time_label = nullptr;
 static lv_obj_t *led_count_spin = nullptr;
+static lv_obj_t *pattern_time_spin = nullptr;
+static lv_obj_t *led_strip_count_value_label = nullptr;
+static lv_obj_t *led_strip_pattern_time_value_label = nullptr;
+static lv_obj_t *pattern_checkbox[PATTERN_COUNT] = {nullptr};
 
 static uint8_t gCurrentPatternNumber = 0;
 static uint8_t gHue = 0;
 static uint8_t gBrightness = 96;
 static uint16_t gLedCount = DEFAULT_LED_COUNT;
+static uint32_t gPatternSwitchMs = DEFAULT_PATTERN_SWITCH_MS;
 static bool gLedRunning = true;
 static bool gLedsOn = false;
 static bool gTouchPressed = false;
@@ -125,6 +137,10 @@ static bool gPrevScheduleActive = false;
 static bool gSchedule1Enabled = true;
 static bool gSchedule2Enabled = true;
 static bool gSchedulePrefsReady = false;
+static bool gPatternEnabled[PATTERN_COUNT] = {true, true, true,
+                                              true, true, true};
+static bool gEditPatternEnabled[PATTERN_COUNT] = {true, true, true,
+                                                  true, true, true};
 
 // Forward declarations for FastLED patterns
 static void rainbow();
@@ -137,11 +153,15 @@ static void addGlitter(fract8 chanceOfGlitter);
 static void nextPattern();
 static void update_main_day_bar();
 static void update_schedule_day_bar();
+static void update_led_strip_labels();
 static void show_main_page();
 static void show_settings_page();
 static void show_schedule_page();
 static void show_schedule_edit_page(ScheduleEditTarget target);
 static void show_led_strip_page();
+static void show_led_strip_count_page();
+static void show_led_strip_pattern_time_page();
+static void show_led_strip_patterns_page();
 
 typedef void (*SimplePatternList[])();
 SimplePatternList gPatterns = {
@@ -169,7 +189,7 @@ static void turn_leds_off() {
   gLedsOn = false;
 }
 
-static void set_backlight(uint8_t level) { analogWrite(TFT_BL, level); }
+static void set_backlight(uint8_t level) { analogWrite(BACKLIGHT_PIN, level); }
 
 static void sleep_display() {
   if (gDisplaySleeping)
@@ -269,15 +289,36 @@ static void update_time_label() {
 }
 
 static void update_pattern_label() {
+  bool has_enabled = false;
+  for (int i = 0; i < PATTERN_COUNT; i++) {
+    if (gPatternEnabled[i]) {
+      has_enabled = true;
+      break;
+    }
+  }
   if (pattern_label) {
-    lv_label_set_text_fmt(pattern_label, "Pattern: %s",
-                          kPatternNames[gCurrentPatternNumber]);
+    if (has_enabled) {
+      lv_label_set_text_fmt(pattern_label, "Pattern: %s",
+                            kPatternNames[gCurrentPatternNumber]);
+    } else {
+      lv_label_set_text(pattern_label, "Pattern: None selected");
+    }
   }
 }
 
 static void update_brightness_label() {
   if (brightness_label) {
     lv_label_set_text_fmt(brightness_label, "Brightness: %u", gBrightness);
+  }
+}
+
+static void update_led_strip_labels() {
+  if (led_strip_count_value_label) {
+    lv_label_set_text_fmt(led_strip_count_value_label, "%u", gLedCount);
+  }
+  if (led_strip_pattern_time_value_label) {
+    lv_label_set_text_fmt(led_strip_pattern_time_value_label, "%lus",
+                          gPatternSwitchMs / 1000UL);
   }
 }
 
@@ -472,6 +513,61 @@ static uint16_t sanitize_led_count(int v) {
   return static_cast<uint16_t>(v);
 }
 
+static uint8_t sanitize_brightness(int v) {
+  if (v < 1)
+    return 1;
+  if (v > 255)
+    return 255;
+  return static_cast<uint8_t>(v);
+}
+
+static uint32_t sanitize_pattern_switch_ms(uint32_t value_ms) {
+  const uint32_t min_ms = MIN_PATTERN_SWITCH_SECONDS * 1000UL;
+  const uint32_t max_ms = MAX_PATTERN_SWITCH_SECONDS * 1000UL;
+  if (value_ms < min_ms)
+    return min_ms;
+  if (value_ms > max_ms)
+    return max_ms;
+  return value_ms;
+}
+
+static bool has_any_enabled_pattern() {
+  for (int i = 0; i < PATTERN_COUNT; i++) {
+    if (gPatternEnabled[i])
+      return true;
+  }
+  return false;
+}
+
+static int first_enabled_pattern_index() {
+  for (int i = 0; i < PATTERN_COUNT; i++) {
+    if (gPatternEnabled[i])
+      return i;
+  }
+  return -1;
+}
+
+static uint8_t make_pattern_mask() {
+  uint8_t mask = 0;
+  for (int i = 0; i < PATTERN_COUNT; i++) {
+    if (gPatternEnabled[i])
+      mask |= (1U << i);
+  }
+  return mask;
+}
+
+static void apply_pattern_mask(uint8_t mask) {
+  for (int i = 0; i < PATTERN_COUNT; i++) {
+    gPatternEnabled[i] = ((mask & (1U << i)) != 0U);
+  }
+  const int first = first_enabled_pattern_index();
+  if (first >= 0) {
+    gCurrentPatternNumber = static_cast<uint8_t>(first);
+  } else {
+    gCurrentPatternNumber = 0;
+  }
+}
+
 static void apply_led_count(uint16_t count) {
   gLedCount = sanitize_led_count(count);
   // Immediately clear full strip so removed tail pixels are not left lit.
@@ -488,6 +584,9 @@ static void save_schedule_config() {
   gPrefs.putBool("s1_en", gSchedule1Enabled);
   gPrefs.putBool("s2_en", gSchedule2Enabled);
   gPrefs.putUShort("led_count", gLedCount);
+  gPrefs.putUChar("brightness", gBrightness);
+  gPrefs.putUInt("pattern_ms", gPatternSwitchMs);
+  gPrefs.putUChar("pattern_mask", make_pattern_mask());
 }
 
 static void load_schedule_config() {
@@ -511,6 +610,11 @@ static void load_schedule_config() {
   gSchedule2Enabled = gPrefs.getBool("s2_en", gSchedule2Enabled);
   gLedCount = sanitize_led_count(
       static_cast<int>(gPrefs.getUShort("led_count", gLedCount)));
+  gBrightness = sanitize_brightness(
+      static_cast<int>(gPrefs.getUChar("brightness", gBrightness)));
+  gPatternSwitchMs = sanitize_pattern_switch_ms(
+      gPrefs.getUInt("pattern_ms", DEFAULT_PATTERN_SWITCH_MS));
+  apply_pattern_mask(gPrefs.getUChar("pattern_mask", make_pattern_mask()));
 }
 
 static void apply_clock_dialog_to_target() {
@@ -631,6 +735,21 @@ static void handle_back_navigation() {
     close_clock_dialog();
     return;
   }
+  if (led_strip_patterns_page &&
+      !lv_obj_has_flag(led_strip_patterns_page, LV_OBJ_FLAG_HIDDEN)) {
+    show_led_strip_page();
+    return;
+  }
+  if (led_strip_pattern_time_page &&
+      !lv_obj_has_flag(led_strip_pattern_time_page, LV_OBJ_FLAG_HIDDEN)) {
+    show_led_strip_page();
+    return;
+  }
+  if (led_strip_count_page &&
+      !lv_obj_has_flag(led_strip_count_page, LV_OBJ_FLAG_HIDDEN)) {
+    show_led_strip_page();
+    return;
+  }
   if (led_strip_page && !lv_obj_has_flag(led_strip_page, LV_OBJ_FLAG_HIDDEN)) {
     show_settings_page();
     return;
@@ -697,6 +816,7 @@ static void brightness_slider_event_cb(lv_event_t *e) {
     return;
   lv_obj_t *slider = lv_event_get_target_obj(e);
   gBrightness = static_cast<uint8_t>(lv_slider_get_value(slider));
+  save_schedule_config();
   FastLED.setBrightness(gBrightness);
   if (!should_render_leds())
     FastLED.show();
@@ -739,6 +859,9 @@ static void show_main_page() {
   lv_obj_add_flag(schedule_page, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(schedule_edit_page, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(led_strip_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_count_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_pattern_time_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_patterns_page, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void show_settings_page() {
@@ -747,6 +870,9 @@ static void show_settings_page() {
   lv_obj_add_flag(schedule_page, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(schedule_edit_page, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(led_strip_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_count_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_pattern_time_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_patterns_page, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void show_schedule_page() {
@@ -755,6 +881,9 @@ static void show_schedule_page() {
   lv_obj_remove_flag(schedule_page, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(schedule_edit_page, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(led_strip_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_count_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_pattern_time_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_patterns_page, LV_OBJ_FLAG_HIDDEN);
   update_schedule_labels();
 }
 
@@ -765,6 +894,9 @@ static void show_schedule_edit_page(ScheduleEditTarget target) {
   lv_obj_add_flag(schedule_page, LV_OBJ_FLAG_HIDDEN);
   lv_obj_remove_flag(schedule_edit_page, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(led_strip_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_count_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_pattern_time_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_patterns_page, LV_OBJ_FLAG_HIDDEN);
   update_schedule_labels();
 }
 
@@ -774,8 +906,58 @@ static void show_led_strip_page() {
   lv_obj_add_flag(schedule_page, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(schedule_edit_page, LV_OBJ_FLAG_HIDDEN);
   lv_obj_remove_flag(led_strip_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_count_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_pattern_time_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_patterns_page, LV_OBJ_FLAG_HIDDEN);
+  update_led_strip_labels();
+}
+
+static void show_led_strip_count_page() {
+  lv_obj_add_flag(main_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(settings_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(schedule_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(schedule_edit_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_remove_flag(led_strip_count_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_pattern_time_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_patterns_page, LV_OBJ_FLAG_HIDDEN);
   if (led_count_spin)
     lv_spinbox_set_value(led_count_spin, gLedCount);
+}
+
+static void show_led_strip_pattern_time_page() {
+  lv_obj_add_flag(main_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(settings_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(schedule_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(schedule_edit_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_count_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_remove_flag(led_strip_pattern_time_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_patterns_page, LV_OBJ_FLAG_HIDDEN);
+  if (pattern_time_spin) {
+    lv_spinbox_set_value(pattern_time_spin, gPatternSwitchMs / 1000UL);
+  }
+}
+
+static void show_led_strip_patterns_page() {
+  lv_obj_add_flag(main_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(settings_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(schedule_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(schedule_edit_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_count_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(led_strip_pattern_time_page, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_remove_flag(led_strip_patterns_page, LV_OBJ_FLAG_HIDDEN);
+  for (int i = 0; i < PATTERN_COUNT; i++) {
+    gEditPatternEnabled[i] = gPatternEnabled[i];
+    if (!pattern_checkbox[i])
+      continue;
+    if (gEditPatternEnabled[i]) {
+      lv_obj_add_state(pattern_checkbox[i], LV_STATE_CHECKED);
+    } else {
+      lv_obj_remove_state(pattern_checkbox[i], LV_STATE_CHECKED);
+    }
+  }
 }
 
 static void schedule_edit_r1_button_event_cb(lv_event_t *e) {
@@ -838,14 +1020,39 @@ static void led_strip_back_button_event_cb(lv_event_t *e) {
   show_settings_page();
 }
 
-static void led_strip_save_button_event_cb(lv_event_t *e) {
+static void led_strip_edit_count_button_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    return;
+  show_led_strip_count_page();
+}
+
+static void led_strip_edit_pattern_time_button_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    return;
+  show_led_strip_pattern_time_page();
+}
+
+static void led_strip_edit_patterns_button_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    return;
+  show_led_strip_patterns_page();
+}
+
+static void led_strip_count_save_button_event_cb(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED)
     return;
   if (!led_count_spin)
     return;
   apply_led_count(static_cast<uint16_t>(lv_spinbox_get_value(led_count_spin)));
   save_schedule_config();
-  show_settings_page();
+  update_led_strip_labels();
+  show_led_strip_page();
+}
+
+static void led_strip_count_back_button_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    return;
+  show_led_strip_page();
 }
 
 static void led_strip_inc_event_cb(lv_event_t *e) {
@@ -868,6 +1075,80 @@ static void led_strip_dec_event_cb(lv_event_t *e) {
   int v = lv_spinbox_get_value(led_count_spin);
   if (v > 1)
     lv_spinbox_set_value(led_count_spin, v - 1);
+}
+
+static void pattern_time_inc_event_cb(lv_event_t *e) {
+  const lv_event_code_t code = lv_event_get_code(e);
+  if (code != LV_EVENT_CLICKED && code != LV_EVENT_LONG_PRESSED_REPEAT)
+    return;
+  if (!pattern_time_spin)
+    return;
+  int v = lv_spinbox_get_value(pattern_time_spin);
+  if (v < MAX_PATTERN_SWITCH_SECONDS)
+    lv_spinbox_set_value(pattern_time_spin, v + 1);
+}
+
+static void pattern_time_dec_event_cb(lv_event_t *e) {
+  const lv_event_code_t code = lv_event_get_code(e);
+  if (code != LV_EVENT_CLICKED && code != LV_EVENT_LONG_PRESSED_REPEAT)
+    return;
+  if (!pattern_time_spin)
+    return;
+  int v = lv_spinbox_get_value(pattern_time_spin);
+  if (v > MIN_PATTERN_SWITCH_SECONDS)
+    lv_spinbox_set_value(pattern_time_spin, v - 1);
+}
+
+static void led_strip_pattern_time_save_button_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    return;
+  if (!pattern_time_spin)
+    return;
+  const uint32_t sec = static_cast<uint32_t>(lv_spinbox_get_value(pattern_time_spin));
+  gPatternSwitchMs = sanitize_pattern_switch_ms(sec * 1000UL);
+  save_schedule_config();
+  update_led_strip_labels();
+  show_led_strip_page();
+}
+
+static void led_strip_pattern_time_back_button_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    return;
+  show_led_strip_page();
+}
+
+static void pattern_checkbox_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED)
+    return;
+  const uintptr_t idx_raw = reinterpret_cast<uintptr_t>(lv_event_get_user_data(e));
+  if (idx_raw >= PATTERN_COUNT)
+    return;
+  const int idx = static_cast<int>(idx_raw);
+  lv_obj_t *sw = lv_event_get_target_obj(e);
+  gEditPatternEnabled[idx] = lv_obj_has_state(sw, LV_STATE_CHECKED);
+}
+
+static void led_strip_patterns_save_button_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    return;
+  for (int i = 0; i < PATTERN_COUNT; i++) {
+    gPatternEnabled[i] = gEditPatternEnabled[i];
+  }
+  const int first = first_enabled_pattern_index();
+  if (first >= 0) {
+    gCurrentPatternNumber = static_cast<uint8_t>(first);
+  } else {
+    gCurrentPatternNumber = 0;
+  }
+  update_pattern_label();
+  save_schedule_config();
+  show_led_strip_page();
+}
+
+static void led_strip_patterns_back_button_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    return;
+  show_led_strip_page();
 }
 
 static void schedule_set_r1_start_button_event_cb(lv_event_t *e) {
@@ -920,8 +1201,16 @@ static void init_fastled() {
 }
 
 static void nextPattern() {
-  gCurrentPatternNumber =
-      (gCurrentPatternNumber + 1) % (sizeof(gPatterns) / sizeof(gPatterns[0]));
+  if (!has_any_enabled_pattern()) {
+    update_pattern_label();
+    return;
+  }
+  for (int i = 0; i < PATTERN_COUNT; i++) {
+    gCurrentPatternNumber = (gCurrentPatternNumber + 1) % PATTERN_COUNT;
+    if (gPatternEnabled[gCurrentPatternNumber]) {
+      break;
+    }
+  }
   update_pattern_label();
 }
 
@@ -937,6 +1226,18 @@ static void run_fastled() {
   static uint32_t last_pattern_ms = 0;
   const uint32_t now = millis();
 
+  if (!has_any_enabled_pattern()) {
+    return;
+  }
+
+  if (!gPatternEnabled[gCurrentPatternNumber]) {
+    const int first = first_enabled_pattern_index();
+    if (first >= 0) {
+      gCurrentPatternNumber = static_cast<uint8_t>(first);
+      update_pattern_label();
+    }
+  }
+
   if (now - last_frame_ms >= (1000U / LED_FPS)) {
     gPatterns[gCurrentPatternNumber]();
     FastLED.show();
@@ -949,7 +1250,7 @@ static void run_fastled() {
     last_hue_ms = now;
   }
 
-  if (now - last_pattern_ms >= PATTERN_SWITCH_MS) {
+  if (now - last_pattern_ms >= gPatternSwitchMs) {
     nextPattern();
     last_pattern_ms = now;
   }
@@ -1052,7 +1353,7 @@ void setup() {
   }
 
   analogWriteResolution(8);
-  set_backlight(DISPLAY_BACKLIGHT_ON_LEVEL);
+  set_backlight(DISPLAY_BACKLIGHT_OFF_LEVEL);
 
   tft.init();
   tft.setRotation(TFT_ROTATION);
@@ -1110,6 +1411,25 @@ void setup() {
   lv_obj_set_size(led_strip_page, TFT_X, TFT_Y);
   lv_obj_set_style_bg_opa(led_strip_page, LV_OPA_TRANSP, LV_PART_MAIN);
   lv_obj_add_flag(led_strip_page, LV_OBJ_FLAG_HIDDEN);
+
+  led_strip_count_page = lv_obj_create(scr);
+  lv_obj_remove_style_all(led_strip_count_page);
+  lv_obj_set_size(led_strip_count_page, TFT_X, TFT_Y);
+  lv_obj_set_style_bg_opa(led_strip_count_page, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_add_flag(led_strip_count_page, LV_OBJ_FLAG_HIDDEN);
+
+  led_strip_pattern_time_page = lv_obj_create(scr);
+  lv_obj_remove_style_all(led_strip_pattern_time_page);
+  lv_obj_set_size(led_strip_pattern_time_page, TFT_X, TFT_Y);
+  lv_obj_set_style_bg_opa(led_strip_pattern_time_page, LV_OPA_TRANSP,
+                          LV_PART_MAIN);
+  lv_obj_add_flag(led_strip_pattern_time_page, LV_OBJ_FLAG_HIDDEN);
+
+  led_strip_patterns_page = lv_obj_create(scr);
+  lv_obj_remove_style_all(led_strip_patterns_page);
+  lv_obj_set_size(led_strip_patterns_page, TFT_X, TFT_Y);
+  lv_obj_set_style_bg_opa(led_strip_patterns_page, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_add_flag(led_strip_patterns_page, LV_OBJ_FLAG_HIDDEN);
 
   // Main page widgets
   time_label = lv_label_create(main_page);
@@ -1225,7 +1545,7 @@ void setup() {
   lv_obj_set_size(schedule_btn, 180, 40);
   lv_obj_align(schedule_btn, LV_ALIGN_TOP_MID, 0, 160);
 
-  // LED strip page widgets
+  // LED strip summary page widgets
   lv_obj_t *led_strip_title = lv_label_create(led_strip_page);
   lv_obj_set_style_text_color(led_strip_title, lv_color_hex(0xFFFFFF),
                               LV_PART_MAIN);
@@ -1236,9 +1556,58 @@ void setup() {
   lv_obj_set_style_text_color(led_count_label, lv_color_hex(0xFFFFFF),
                               LV_PART_MAIN);
   lv_label_set_text(led_count_label, "LED Count");
-  lv_obj_align(led_count_label, LV_ALIGN_TOP_MID, 0, 48);
+  lv_obj_align(led_count_label, LV_ALIGN_TOP_LEFT, 14, 54);
 
-  led_count_spin = lv_spinbox_create(led_strip_page);
+  led_strip_count_value_label = lv_label_create(led_strip_page);
+  lv_obj_set_style_text_color(led_strip_count_value_label, lv_color_hex(0xFFFFFF),
+                              LV_PART_MAIN);
+  lv_obj_align(led_strip_count_value_label, LV_ALIGN_TOP_RIGHT, -90, 54);
+
+  lv_obj_t *led_count_edit_btn = make_button(
+      led_strip_page, "Edit", led_strip_edit_count_button_event_cb);
+  lv_obj_set_size(led_count_edit_btn, 70, 30);
+  lv_obj_align(led_count_edit_btn, LV_ALIGN_TOP_RIGHT, -12, 46);
+
+  lv_obj_t *pattern_time_label = lv_label_create(led_strip_page);
+  lv_obj_set_style_text_color(pattern_time_label, lv_color_hex(0xFFFFFF),
+                              LV_PART_MAIN);
+  lv_label_set_text(pattern_time_label, "Pattern Time");
+  lv_obj_align(pattern_time_label, LV_ALIGN_TOP_LEFT, 14, 104);
+
+  led_strip_pattern_time_value_label = lv_label_create(led_strip_page);
+  lv_obj_set_style_text_color(led_strip_pattern_time_value_label,
+                              lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_align(led_strip_pattern_time_value_label, LV_ALIGN_TOP_RIGHT, -90, 104);
+
+  lv_obj_t *pattern_time_edit_btn = make_button(
+      led_strip_page, "Edit", led_strip_edit_pattern_time_button_event_cb);
+  lv_obj_set_size(pattern_time_edit_btn, 70, 30);
+  lv_obj_align(pattern_time_edit_btn, LV_ALIGN_TOP_RIGHT, -12, 96);
+
+  lv_obj_t *patterns_label = lv_label_create(led_strip_page);
+  lv_obj_set_style_text_color(patterns_label, lv_color_hex(0xFFFFFF),
+                              LV_PART_MAIN);
+  lv_label_set_text(patterns_label, "Patterns");
+  lv_obj_align(patterns_label, LV_ALIGN_TOP_LEFT, 14, 154);
+
+  lv_obj_t *patterns_edit_btn = make_button(
+      led_strip_page, "Edit", led_strip_edit_patterns_button_event_cb);
+  lv_obj_set_size(patterns_edit_btn, 70, 30);
+  lv_obj_align(patterns_edit_btn, LV_ALIGN_TOP_RIGHT, -12, 146);
+
+  lv_obj_t *led_back_btn =
+      make_button(led_strip_page, "Back", led_strip_back_button_event_cb);
+  lv_obj_set_size(led_back_btn, 90, 34);
+  lv_obj_align(led_back_btn, LV_ALIGN_BOTTOM_MID, 0, -12);
+
+  // LED count edit page
+  lv_obj_t *led_count_page_title = lv_label_create(led_strip_count_page);
+  lv_obj_set_style_text_color(led_count_page_title, lv_color_hex(0xFFFFFF),
+                              LV_PART_MAIN);
+  lv_label_set_text(led_count_page_title, "LED Count");
+  lv_obj_align(led_count_page_title, LV_ALIGN_TOP_MID, 0, 8);
+
+  led_count_spin = lv_spinbox_create(led_strip_count_page);
   lv_spinbox_set_range(led_count_spin, 1, MAX_LEDS);
   lv_spinbox_set_digit_format(led_count_spin, 3, 0);
   lv_spinbox_set_value(led_count_spin, gLedCount);
@@ -1252,28 +1621,118 @@ void setup() {
                               LV_PART_MAIN);
 
   lv_obj_t *led_inc_btn =
-      make_button(led_strip_page, "+", led_strip_inc_event_cb);
+      make_button(led_strip_count_page, "+", led_strip_inc_event_cb);
   lv_obj_set_size(led_inc_btn, 70, 40);
   lv_obj_align(led_inc_btn, LV_ALIGN_TOP_MID, 48, 136);
   lv_obj_add_event_cb(led_inc_btn, led_strip_inc_event_cb,
                       LV_EVENT_LONG_PRESSED_REPEAT, nullptr);
 
   lv_obj_t *led_dec_btn =
-      make_button(led_strip_page, "-", led_strip_dec_event_cb);
+      make_button(led_strip_count_page, "-", led_strip_dec_event_cb);
   lv_obj_set_size(led_dec_btn, 70, 40);
   lv_obj_align(led_dec_btn, LV_ALIGN_TOP_MID, -48, 136);
   lv_obj_add_event_cb(led_dec_btn, led_strip_dec_event_cb,
                       LV_EVENT_LONG_PRESSED_REPEAT, nullptr);
 
-  lv_obj_t *led_save_btn =
-      make_button(led_strip_page, "Save", led_strip_save_button_event_cb);
-  lv_obj_set_size(led_save_btn, 90, 34);
-  lv_obj_align(led_save_btn, LV_ALIGN_BOTTOM_RIGHT, -18, -12);
+  lv_obj_t *led_count_save_btn = make_button(
+      led_strip_count_page, "Save", led_strip_count_save_button_event_cb);
+  lv_obj_set_size(led_count_save_btn, 90, 34);
+  lv_obj_align(led_count_save_btn, LV_ALIGN_BOTTOM_RIGHT, -18, -12);
 
-  lv_obj_t *led_back_btn =
-      make_button(led_strip_page, "Back", led_strip_back_button_event_cb);
-  lv_obj_set_size(led_back_btn, 90, 34);
-  lv_obj_align(led_back_btn, LV_ALIGN_BOTTOM_LEFT, 18, -12);
+  lv_obj_t *led_count_back_btn = make_button(
+      led_strip_count_page, "Back", led_strip_count_back_button_event_cb);
+  lv_obj_set_size(led_count_back_btn, 90, 34);
+  lv_obj_align(led_count_back_btn, LV_ALIGN_BOTTOM_LEFT, 18, -12);
+
+  // Pattern time edit page
+  lv_obj_t *pattern_time_page_title = lv_label_create(led_strip_pattern_time_page);
+  lv_obj_set_style_text_color(pattern_time_page_title, lv_color_hex(0xFFFFFF),
+                              LV_PART_MAIN);
+  lv_label_set_text(pattern_time_page_title, "Pattern Time");
+  lv_obj_align(pattern_time_page_title, LV_ALIGN_TOP_MID, 0, 8);
+
+  pattern_time_spin = lv_spinbox_create(led_strip_pattern_time_page);
+  lv_spinbox_set_range(pattern_time_spin, MIN_PATTERN_SWITCH_SECONDS,
+                       MAX_PATTERN_SWITCH_SECONDS);
+  lv_spinbox_set_digit_format(pattern_time_spin, 3, 0);
+  lv_spinbox_set_value(pattern_time_spin, gPatternSwitchMs / 1000UL);
+  lv_obj_set_size(pattern_time_spin, 108, 48);
+  lv_obj_align(pattern_time_spin, LV_ALIGN_TOP_MID, 0, 64);
+  lv_obj_set_style_bg_color(pattern_time_spin, lv_color_hex(0x1B1B1B),
+                            LV_PART_MAIN);
+  lv_obj_set_style_text_color(pattern_time_spin, lv_color_hex(0xFFFFFF),
+                              LV_PART_MAIN);
+  lv_obj_set_style_text_align(pattern_time_spin, LV_TEXT_ALIGN_CENTER,
+                              LV_PART_MAIN);
+
+  lv_obj_t *pattern_time_units = lv_label_create(led_strip_pattern_time_page);
+  lv_obj_set_style_text_color(pattern_time_units, lv_color_hex(0xFFFFFF),
+                              LV_PART_MAIN);
+  lv_label_set_text(pattern_time_units, "seconds");
+  lv_obj_align_to(pattern_time_units, pattern_time_spin, LV_ALIGN_OUT_BOTTOM_MID,
+                  0, 4);
+
+  lv_obj_t *pattern_time_inc_btn = make_button(
+      led_strip_pattern_time_page, "+", pattern_time_inc_event_cb);
+  lv_obj_set_size(pattern_time_inc_btn, 70, 40);
+  lv_obj_align(pattern_time_inc_btn, LV_ALIGN_TOP_MID, 48, 136);
+  lv_obj_add_event_cb(pattern_time_inc_btn, pattern_time_inc_event_cb,
+                      LV_EVENT_LONG_PRESSED_REPEAT, nullptr);
+
+  lv_obj_t *pattern_time_dec_btn = make_button(
+      led_strip_pattern_time_page, "-", pattern_time_dec_event_cb);
+  lv_obj_set_size(pattern_time_dec_btn, 70, 40);
+  lv_obj_align(pattern_time_dec_btn, LV_ALIGN_TOP_MID, -48, 136);
+  lv_obj_add_event_cb(pattern_time_dec_btn, pattern_time_dec_event_cb,
+                      LV_EVENT_LONG_PRESSED_REPEAT, nullptr);
+
+  lv_obj_t *pattern_time_save_btn =
+      make_button(led_strip_pattern_time_page, "Save",
+                  led_strip_pattern_time_save_button_event_cb);
+  lv_obj_set_size(pattern_time_save_btn, 90, 34);
+  lv_obj_align(pattern_time_save_btn, LV_ALIGN_BOTTOM_RIGHT, -18, -12);
+
+  lv_obj_t *pattern_time_back_btn =
+      make_button(led_strip_pattern_time_page, "Back",
+                  led_strip_pattern_time_back_button_event_cb);
+  lv_obj_set_size(pattern_time_back_btn, 90, 34);
+  lv_obj_align(pattern_time_back_btn, LV_ALIGN_BOTTOM_LEFT, 18, -12);
+
+  // Pattern selection page
+  lv_obj_t *patterns_page_title = lv_label_create(led_strip_patterns_page);
+  lv_obj_set_style_text_color(patterns_page_title, lv_color_hex(0xFFFFFF),
+                              LV_PART_MAIN);
+  lv_label_set_text(patterns_page_title, "Patterns");
+  lv_obj_align(patterns_page_title, LV_ALIGN_TOP_MID, 0, 8);
+
+  for (int i = 0; i < PATTERN_COUNT; i++) {
+    lv_obj_t *row_label = lv_label_create(led_strip_patterns_page);
+    lv_obj_set_style_text_color(row_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_label_set_text(row_label, kPatternNames[i]);
+    lv_obj_align(row_label, LV_ALIGN_TOP_LEFT, 14, 42 + (i * 28));
+
+    pattern_checkbox[i] = lv_checkbox_create(led_strip_patterns_page);
+    lv_checkbox_set_text(pattern_checkbox[i], "");
+    lv_obj_align(pattern_checkbox[i], LV_ALIGN_TOP_RIGHT, -14, 38 + (i * 28));
+    lv_obj_add_event_cb(pattern_checkbox[i], pattern_checkbox_event_cb,
+                        LV_EVENT_VALUE_CHANGED,
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(i)));
+    if (gPatternEnabled[i]) {
+      lv_obj_add_state(pattern_checkbox[i], LV_STATE_CHECKED);
+    }
+  }
+
+  lv_obj_t *patterns_save_btn = make_button(
+      led_strip_patterns_page, "Save", led_strip_patterns_save_button_event_cb);
+  lv_obj_set_size(patterns_save_btn, 90, 34);
+  lv_obj_align(patterns_save_btn, LV_ALIGN_BOTTOM_RIGHT, -18, -12);
+
+  lv_obj_t *patterns_back_btn = make_button(
+      led_strip_patterns_page, "Back", led_strip_patterns_back_button_event_cb);
+  lv_obj_set_size(patterns_back_btn, 90, 34);
+  lv_obj_align(patterns_back_btn, LV_ALIGN_BOTTOM_LEFT, 18, -12);
+
+  update_led_strip_labels();
 
   // Schedule summary page widgets
   lv_obj_t *sched_title = lv_label_create(schedule_page);
@@ -1471,6 +1930,9 @@ void setup() {
   lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 12, -12);
 
   init_fastled();
+  // Draw the first LVGL frame, then enable backlight.
+  lv_timer_handler();
+  set_backlight(DISPLAY_BACKLIGHT_ON_LEVEL);
   gPrevScheduleActive = is_schedule_active_now();
   gLastTouchMs = millis();
 }
