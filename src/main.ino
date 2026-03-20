@@ -13,6 +13,9 @@
 #define TFT_X 240
 #define TFT_Y 280
 #define TFT_ROTATION 0
+#define DISPLAY_SLEEP_TIMEOUT_MS (5UL * 60UL * 1000UL)
+#define DISPLAY_BACKLIGHT_ON_LEVEL 127
+#define DISPLAY_BACKLIGHT_OFF_LEVEL 0
 
 // touch
 #define TP_SDA 4
@@ -106,6 +109,7 @@ static bool gLedsOn = false;
 static bool gTouchPressed = false;
 static uint32_t gLastTouchMs = 0;
 static uint32_t gLastBackSwipeMs = 0;
+static bool gDisplaySleeping = false;
 
 static int gClockHour = 19;
 static int gClockMinute = 0;
@@ -165,6 +169,26 @@ static void turn_leds_off() {
   gLedsOn = false;
 }
 
+static void set_backlight(uint8_t level) { analogWrite(TFT_BL, level); }
+
+static void sleep_display() {
+  if (gDisplaySleeping)
+    return;
+  tft.fillScreen(TFT_BLACK);
+  set_backlight(DISPLAY_BACKLIGHT_OFF_LEVEL);
+  gDisplaySleeping = true;
+}
+
+static void wake_display() {
+  if (!gDisplaySleeping)
+    return;
+  set_backlight(DISPLAY_BACKLIGHT_ON_LEVEL);
+  gDisplaySleeping = false;
+  if (lv_screen_active()) {
+    lv_obj_invalidate(lv_screen_active());
+  }
+}
+
 static int now_minutes() { return (gClockHour * 60) + gClockMinute; }
 
 static bool is_in_range(int now, int start_min, int end_min) {
@@ -180,10 +204,12 @@ static bool is_any_schedule_enabled() {
 
 static bool is_schedule_active_now() {
   const int now = now_minutes();
-  const bool r1_active = gSchedule1Enabled &&
-                         is_in_range(now, gSchedule1StartMinutes, gSchedule1EndMinutes);
-  const bool r2_active = gSchedule2Enabled &&
-                         is_in_range(now, gSchedule2StartMinutes, gSchedule2EndMinutes);
+  const bool r1_active =
+      gSchedule1Enabled &&
+      is_in_range(now, gSchedule1StartMinutes, gSchedule1EndMinutes);
+  const bool r2_active =
+      gSchedule2Enabled &&
+      is_in_range(now, gSchedule2StartMinutes, gSchedule2EndMinutes);
   return r1_active || r2_active;
 }
 
@@ -255,8 +281,8 @@ static void update_brightness_label() {
   }
 }
 
-static void update_day_bar_segments(lv_obj_t *seg0, lv_obj_t *seg1, lv_obj_t *seg2,
-                                    lv_obj_t *seg3) {
+static void update_day_bar_segments(lv_obj_t *seg0, lv_obj_t *seg1,
+                                    lv_obj_t *seg2, lv_obj_t *seg3) {
   if (!seg0 || !seg1 || !seg2 || !seg3) {
     return;
   }
@@ -278,12 +304,14 @@ static void update_day_bar_segments(lv_obj_t *seg0, lv_obj_t *seg1, lv_obj_t *se
   int count = 0;
 
   auto add_interval = [&](int s, int e) {
-    if (e <= s || count >= 4) return;
+    if (e <= s || count >= 4)
+      return;
     intervals[count++] = {s, e};
   };
 
   auto add_range = [&](bool enabled, int start_min, int end_min) {
-    if (!enabled || start_min == end_min) return;
+    if (!enabled || start_min == end_min)
+      return;
     if (start_min < end_min) {
       add_interval(start_min, end_min);
     } else {
@@ -294,7 +322,8 @@ static void update_day_bar_segments(lv_obj_t *seg0, lv_obj_t *seg1, lv_obj_t *se
 
   add_range(gSchedule1Enabled, gSchedule1StartMinutes, gSchedule1EndMinutes);
   add_range(gSchedule2Enabled, gSchedule2StartMinutes, gSchedule2EndMinutes);
-  if (count == 0) return;
+  if (count == 0)
+    return;
 
   for (int i = 0; i < count - 1; i++) {
     for (int j = i + 1; j < count; j++) {
@@ -310,26 +339,31 @@ static void update_day_bar_segments(lv_obj_t *seg0, lv_obj_t *seg1, lv_obj_t *se
   int merged_count = 0;
   for (int i = 0; i < count; i++) {
     if (merged_count == 0 || intervals[i].s > merged[merged_count - 1].e) {
-      if (merged_count < 4) merged[merged_count++] = intervals[i];
+      if (merged_count < 4)
+        merged[merged_count++] = intervals[i];
     } else {
-      merged[merged_count - 1].e = max(merged[merged_count - 1].e, intervals[i].e);
+      merged[merged_count - 1].e =
+          max(merged[merged_count - 1].e, intervals[i].e);
     }
   }
 
   for (int i = 0; i < merged_count && i < 4; i++) {
     int x = (merged[i].s * kBarW) / kDayMinutes;
     int w = (merged[i].e * kBarW) / kDayMinutes - x;
-    if (w < 2) w = 2;
+    if (w < 2)
+      w = 2;
     lv_obj_set_size(segs[i], w, kBarH);
     lv_obj_set_pos(segs[i], x, 0);
     lv_obj_remove_flag(segs[i], LV_OBJ_FLAG_HIDDEN);
   }
 }
 
-static void update_day_bar_and_marker(lv_obj_t *track, lv_obj_t *marker, lv_obj_t *seg0,
-                                      lv_obj_t *seg1, lv_obj_t *seg2, lv_obj_t *seg3) {
+static void update_day_bar_and_marker(lv_obj_t *track, lv_obj_t *marker,
+                                      lv_obj_t *seg0, lv_obj_t *seg1,
+                                      lv_obj_t *seg2, lv_obj_t *seg3) {
   update_day_bar_segments(seg0, seg1, seg2, seg3);
-  if (!track || !marker) return;
+  if (!track || !marker)
+    return;
   constexpr int kDayMinutes = 24 * 60;
   constexpr int kBarW = 180;
   const int x = (now_minutes() * kBarW) / kDayMinutes;
@@ -339,12 +373,10 @@ static void update_day_bar_and_marker(lv_obj_t *track, lv_obj_t *marker, lv_obj_
 }
 
 static void update_schedule_day_bar() {
-  update_day_bar_and_marker(schedule_summary_day_bar_track,
-                            schedule_summary_day_bar_marker,
-                            schedule_summary_day_bar_seg_0,
-                            schedule_summary_day_bar_seg_1,
-                            schedule_summary_day_bar_seg_2,
-                            schedule_summary_day_bar_seg_3);
+  update_day_bar_and_marker(
+      schedule_summary_day_bar_track, schedule_summary_day_bar_marker,
+      schedule_summary_day_bar_seg_0, schedule_summary_day_bar_seg_1,
+      schedule_summary_day_bar_seg_2, schedule_summary_day_bar_seg_3);
 }
 
 static void update_main_day_bar() {
@@ -368,8 +400,8 @@ static void update_schedule_labels() {
                   r2_end_buf, sizeof(r2_end_buf));
   const bool editing_r1 = (gScheduleEditTarget == SCHEDULE_EDIT_RANGE1);
   if (schedule_edit_title_label) {
-    lv_label_set_text(schedule_edit_title_label, editing_r1 ? "Edit Morning"
-                                                            : "Edit Evening");
+    lv_label_set_text(schedule_edit_title_label,
+                      editing_r1 ? "Edit Morning" : "Edit Evening");
   }
   if (schedule_range1_start_time_label) {
     lv_label_set_text(schedule_range1_start_time_label,
@@ -395,16 +427,16 @@ static void update_schedule_labels() {
                                 LV_PART_MAIN);
   }
   if (schedule_summary_r1_time_label) {
-    lv_label_set_text_fmt(schedule_summary_r1_time_label, "%s - %s", r1_start_buf,
-                          r1_end_buf);
+    lv_label_set_text_fmt(schedule_summary_r1_time_label, "%s - %s",
+                          r1_start_buf, r1_end_buf);
     lv_obj_set_style_text_color(schedule_summary_r1_time_label,
                                 gSchedule1Enabled ? lv_color_hex(0xFFFFFF)
                                                   : lv_color_hex(0x777777),
                                 LV_PART_MAIN);
   }
   if (schedule_summary_r2_time_label) {
-    lv_label_set_text_fmt(schedule_summary_r2_time_label, "%s - %s", r2_start_buf,
-                          r2_end_buf);
+    lv_label_set_text_fmt(schedule_summary_r2_time_label, "%s - %s",
+                          r2_start_buf, r2_end_buf);
     lv_obj_set_style_text_color(schedule_summary_r2_time_label,
                                 gSchedule2Enabled ? lv_color_hex(0xFFFFFF)
                                                   : lv_color_hex(0x777777),
@@ -427,13 +459,16 @@ static void update_schedule_labels() {
 }
 
 static int sanitize_minutes_of_day(int v, int fallback) {
-  if (v < 0 || v >= (24 * 60)) return fallback;
+  if (v < 0 || v >= (24 * 60))
+    return fallback;
   return v;
 }
 
 static uint16_t sanitize_led_count(int v) {
-  if (v < 1) return 1;
-  if (v > MAX_LEDS) return MAX_LEDS;
+  if (v < 1)
+    return 1;
+  if (v > MAX_LEDS)
+    return MAX_LEDS;
   return static_cast<uint16_t>(v);
 }
 
@@ -444,7 +479,8 @@ static void apply_led_count(uint16_t count) {
 }
 
 static void save_schedule_config() {
-  if (!gSchedulePrefsReady) return;
+  if (!gSchedulePrefsReady)
+    return;
   gPrefs.putUShort("s1_start", static_cast<uint16_t>(gSchedule1StartMinutes));
   gPrefs.putUShort("s1_end", static_cast<uint16_t>(gSchedule1EndMinutes));
   gPrefs.putUShort("s2_start", static_cast<uint16_t>(gSchedule2StartMinutes));
@@ -456,21 +492,25 @@ static void save_schedule_config() {
 
 static void load_schedule_config() {
   gSchedule1StartMinutes = sanitize_minutes_of_day(
-      static_cast<int>(gPrefs.getUShort("s1_start", static_cast<uint16_t>(gSchedule1StartMinutes))),
+      static_cast<int>(gPrefs.getUShort(
+          "s1_start", static_cast<uint16_t>(gSchedule1StartMinutes))),
       gSchedule1StartMinutes);
   gSchedule1EndMinutes = sanitize_minutes_of_day(
-      static_cast<int>(gPrefs.getUShort("s1_end", static_cast<uint16_t>(gSchedule1EndMinutes))),
+      static_cast<int>(gPrefs.getUShort(
+          "s1_end", static_cast<uint16_t>(gSchedule1EndMinutes))),
       gSchedule1EndMinutes);
   gSchedule2StartMinutes = sanitize_minutes_of_day(
-      static_cast<int>(gPrefs.getUShort("s2_start", static_cast<uint16_t>(gSchedule2StartMinutes))),
+      static_cast<int>(gPrefs.getUShort(
+          "s2_start", static_cast<uint16_t>(gSchedule2StartMinutes))),
       gSchedule2StartMinutes);
   gSchedule2EndMinutes = sanitize_minutes_of_day(
-      static_cast<int>(gPrefs.getUShort("s2_end", static_cast<uint16_t>(gSchedule2EndMinutes))),
+      static_cast<int>(gPrefs.getUShort(
+          "s2_end", static_cast<uint16_t>(gSchedule2EndMinutes))),
       gSchedule2EndMinutes);
   gSchedule1Enabled = gPrefs.getBool("s1_en", gSchedule1Enabled);
   gSchedule2Enabled = gPrefs.getBool("s2_en", gSchedule2Enabled);
-  gLedCount =
-      sanitize_led_count(static_cast<int>(gPrefs.getUShort("led_count", gLedCount)));
+  gLedCount = sanitize_led_count(
+      static_cast<int>(gPrefs.getUShort("led_count", gLedCount)));
 }
 
 static void apply_clock_dialog_to_target() {
@@ -734,7 +774,8 @@ static void show_led_strip_page() {
   lv_obj_add_flag(schedule_page, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(schedule_edit_page, LV_OBJ_FLAG_HIDDEN);
   lv_obj_remove_flag(led_strip_page, LV_OBJ_FLAG_HIDDEN);
-  if (led_count_spin) lv_spinbox_set_value(led_count_spin, gLedCount);
+  if (led_count_spin)
+    lv_spinbox_set_value(led_count_spin, gLedCount);
 }
 
 static void schedule_edit_r1_button_event_cb(lv_event_t *e) {
@@ -800,7 +841,8 @@ static void led_strip_back_button_event_cb(lv_event_t *e) {
 static void led_strip_save_button_event_cb(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED)
     return;
-  if (!led_count_spin) return;
+  if (!led_count_spin)
+    return;
   apply_led_count(static_cast<uint16_t>(lv_spinbox_get_value(led_count_spin)));
   save_schedule_config();
   show_settings_page();
@@ -810,18 +852,22 @@ static void led_strip_inc_event_cb(lv_event_t *e) {
   const lv_event_code_t code = lv_event_get_code(e);
   if (code != LV_EVENT_CLICKED && code != LV_EVENT_LONG_PRESSED_REPEAT)
     return;
-  if (!led_count_spin) return;
+  if (!led_count_spin)
+    return;
   int v = lv_spinbox_get_value(led_count_spin);
-  if (v < MAX_LEDS) lv_spinbox_set_value(led_count_spin, v + 1);
+  if (v < MAX_LEDS)
+    lv_spinbox_set_value(led_count_spin, v + 1);
 }
 
 static void led_strip_dec_event_cb(lv_event_t *e) {
   const lv_event_code_t code = lv_event_get_code(e);
   if (code != LV_EVENT_CLICKED && code != LV_EVENT_LONG_PRESSED_REPEAT)
     return;
-  if (!led_count_spin) return;
+  if (!led_count_spin)
+    return;
   int v = lv_spinbox_get_value(led_count_spin);
-  if (v > 1) lv_spinbox_set_value(led_count_spin, v - 1);
+  if (v > 1)
+    lv_spinbox_set_value(led_count_spin, v - 1);
 }
 
 static void schedule_set_r1_start_button_event_cb(lv_event_t *e) {
@@ -1006,7 +1052,7 @@ void setup() {
   }
 
   analogWriteResolution(8);
-  analogWrite(TFT_BL, 127);
+  set_backlight(DISPLAY_BACKLIGHT_ON_LEVEL);
 
   tft.init();
   tft.setRotation(TFT_ROTATION);
@@ -1081,7 +1127,8 @@ void setup() {
   lv_obj_remove_style_all(main_day_bar_track);
   lv_obj_set_size(main_day_bar_track, 180, 8);
   lv_obj_align(main_day_bar_track, LV_ALIGN_TOP_MID, 0, 32);
-  lv_obj_set_style_bg_color(main_day_bar_track, lv_color_hex(0x4A4A4A), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(main_day_bar_track, lv_color_hex(0x4A4A4A),
+                            LV_PART_MAIN);
   lv_obj_set_style_bg_opa(main_day_bar_track, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_radius(main_day_bar_track, 4, LV_PART_MAIN);
 
@@ -1101,7 +1148,8 @@ void setup() {
   main_day_bar_marker = lv_obj_create(main_page);
   lv_obj_remove_style_all(main_day_bar_marker);
   lv_obj_set_size(main_day_bar_marker, 2, 12);
-  lv_obj_set_style_bg_color(main_day_bar_marker, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(main_day_bar_marker, lv_color_hex(0xFFFFFF),
+                            LV_PART_MAIN);
   lv_obj_set_style_bg_opa(main_day_bar_marker, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_radius(main_day_bar_marker, 1, LV_PART_MAIN);
   update_main_day_bar();
@@ -1152,7 +1200,8 @@ void setup() {
 
   // Settings page widgets
   lv_obj_t *settings_title = lv_label_create(settings_page);
-  lv_obj_set_style_text_color(settings_title, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_text_color(settings_title, lv_color_hex(0xFFFFFF),
+                              LV_PART_MAIN);
   lv_label_set_text(settings_title, "Settings");
   lv_obj_align(settings_title, LV_ALIGN_TOP_MID, 0, 8);
 
@@ -1178,12 +1227,14 @@ void setup() {
 
   // LED strip page widgets
   lv_obj_t *led_strip_title = lv_label_create(led_strip_page);
-  lv_obj_set_style_text_color(led_strip_title, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_text_color(led_strip_title, lv_color_hex(0xFFFFFF),
+                              LV_PART_MAIN);
   lv_label_set_text(led_strip_title, "LED Strip");
   lv_obj_align(led_strip_title, LV_ALIGN_TOP_MID, 0, 8);
 
   lv_obj_t *led_count_label = lv_label_create(led_strip_page);
-  lv_obj_set_style_text_color(led_count_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_text_color(led_count_label, lv_color_hex(0xFFFFFF),
+                              LV_PART_MAIN);
   lv_label_set_text(led_count_label, "LED Count");
   lv_obj_align(led_count_label, LV_ALIGN_TOP_MID, 0, 48);
 
@@ -1193,21 +1244,26 @@ void setup() {
   lv_spinbox_set_value(led_count_spin, gLedCount);
   lv_obj_set_size(led_count_spin, 96, 48);
   lv_obj_align(led_count_spin, LV_ALIGN_TOP_MID, 0, 76);
-  lv_obj_set_style_bg_color(led_count_spin, lv_color_hex(0x1B1B1B), LV_PART_MAIN);
-  lv_obj_set_style_text_color(led_count_spin, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_set_style_text_align(led_count_spin, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(led_count_spin, lv_color_hex(0x1B1B1B),
+                            LV_PART_MAIN);
+  lv_obj_set_style_text_color(led_count_spin, lv_color_hex(0xFFFFFF),
+                              LV_PART_MAIN);
+  lv_obj_set_style_text_align(led_count_spin, LV_TEXT_ALIGN_CENTER,
+                              LV_PART_MAIN);
 
-  lv_obj_t *led_inc_btn = make_button(led_strip_page, "+", led_strip_inc_event_cb);
+  lv_obj_t *led_inc_btn =
+      make_button(led_strip_page, "+", led_strip_inc_event_cb);
   lv_obj_set_size(led_inc_btn, 70, 40);
   lv_obj_align(led_inc_btn, LV_ALIGN_TOP_MID, 48, 136);
-  lv_obj_add_event_cb(led_inc_btn, led_strip_inc_event_cb, LV_EVENT_LONG_PRESSED_REPEAT,
-                      nullptr);
+  lv_obj_add_event_cb(led_inc_btn, led_strip_inc_event_cb,
+                      LV_EVENT_LONG_PRESSED_REPEAT, nullptr);
 
-  lv_obj_t *led_dec_btn = make_button(led_strip_page, "-", led_strip_dec_event_cb);
+  lv_obj_t *led_dec_btn =
+      make_button(led_strip_page, "-", led_strip_dec_event_cb);
   lv_obj_set_size(led_dec_btn, 70, 40);
   lv_obj_align(led_dec_btn, LV_ALIGN_TOP_MID, -48, 136);
-  lv_obj_add_event_cb(led_dec_btn, led_strip_dec_event_cb, LV_EVENT_LONG_PRESSED_REPEAT,
-                      nullptr);
+  lv_obj_add_event_cb(led_dec_btn, led_strip_dec_event_cb,
+                      LV_EVENT_LONG_PRESSED_REPEAT, nullptr);
 
   lv_obj_t *led_save_btn =
       make_button(led_strip_page, "Save", led_strip_save_button_event_cb);
@@ -1265,17 +1321,23 @@ void setup() {
   lv_obj_remove_style_all(schedule_summary_day_bar_track);
   lv_obj_set_size(schedule_summary_day_bar_track, 180, 8);
   lv_obj_align(schedule_summary_day_bar_track, LV_ALIGN_TOP_MID, 0, 32);
-  lv_obj_set_style_bg_color(schedule_summary_day_bar_track, lv_color_hex(0x4A4A4A),
-                            LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(schedule_summary_day_bar_track, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(schedule_summary_day_bar_track,
+                            lv_color_hex(0x4A4A4A), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(schedule_summary_day_bar_track, LV_OPA_COVER,
+                          LV_PART_MAIN);
   lv_obj_set_style_radius(schedule_summary_day_bar_track, 4, LV_PART_MAIN);
 
-  schedule_summary_day_bar_seg_0 = lv_obj_create(schedule_summary_day_bar_track);
-  schedule_summary_day_bar_seg_1 = lv_obj_create(schedule_summary_day_bar_track);
-  schedule_summary_day_bar_seg_2 = lv_obj_create(schedule_summary_day_bar_track);
-  schedule_summary_day_bar_seg_3 = lv_obj_create(schedule_summary_day_bar_track);
-  lv_obj_t *bar_segs[4] = {schedule_summary_day_bar_seg_0, schedule_summary_day_bar_seg_1,
-                           schedule_summary_day_bar_seg_2, schedule_summary_day_bar_seg_3};
+  schedule_summary_day_bar_seg_0 =
+      lv_obj_create(schedule_summary_day_bar_track);
+  schedule_summary_day_bar_seg_1 =
+      lv_obj_create(schedule_summary_day_bar_track);
+  schedule_summary_day_bar_seg_2 =
+      lv_obj_create(schedule_summary_day_bar_track);
+  schedule_summary_day_bar_seg_3 =
+      lv_obj_create(schedule_summary_day_bar_track);
+  lv_obj_t *bar_segs[4] = {
+      schedule_summary_day_bar_seg_0, schedule_summary_day_bar_seg_1,
+      schedule_summary_day_bar_seg_2, schedule_summary_day_bar_seg_3};
   for (auto *seg : bar_segs) {
     lv_obj_remove_style_all(seg);
     lv_obj_set_style_bg_color(seg, lv_color_hex(0x4CD964), LV_PART_MAIN);
@@ -1286,9 +1348,10 @@ void setup() {
   schedule_summary_day_bar_marker = lv_obj_create(schedule_page);
   lv_obj_remove_style_all(schedule_summary_day_bar_marker);
   lv_obj_set_size(schedule_summary_day_bar_marker, 2, 12);
-  lv_obj_set_style_bg_color(schedule_summary_day_bar_marker, lv_color_hex(0xFFFFFF),
-                            LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(schedule_summary_day_bar_marker, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(schedule_summary_day_bar_marker,
+                            lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(schedule_summary_day_bar_marker, LV_OPA_COVER,
+                          LV_PART_MAIN);
   lv_obj_set_style_radius(schedule_summary_day_bar_marker, 1, LV_PART_MAIN);
 
   // Range edit page widgets
@@ -1298,8 +1361,8 @@ void setup() {
   lv_label_set_text(schedule_edit_title_label, "Edit Morning");
   lv_obj_align(schedule_edit_title_label, LV_ALIGN_TOP_MID, 0, 8);
 
-  lv_obj_t *edit_back_btn =
-      make_button(schedule_edit_page, "Back", schedule_edit_back_button_event_cb);
+  lv_obj_t *edit_back_btn = make_button(schedule_edit_page, "Back",
+                                        schedule_edit_back_button_event_cb);
   lv_obj_set_size(edit_back_btn, 90, 34);
   lv_obj_align(edit_back_btn, LV_ALIGN_BOTTOM_MID, 0, -12);
 
@@ -1316,13 +1379,13 @@ void setup() {
                       schedule_range1_enable_switch_event_cb,
                       LV_EVENT_VALUE_CHANGED, nullptr);
 
-  schedule_range1_start_btn = make_button(schedule_edit_page, "Start",
-                                          schedule_set_r1_start_button_event_cb);
+  schedule_range1_start_btn = make_button(
+      schedule_edit_page, "Start", schedule_set_r1_start_button_event_cb);
   lv_obj_set_size(schedule_range1_start_btn, 96, 34);
   lv_obj_align(schedule_range1_start_btn, LV_ALIGN_TOP_LEFT, 14, 92);
 
-  schedule_range1_end_btn =
-      make_button(schedule_edit_page, "End", schedule_set_r1_end_button_event_cb);
+  schedule_range1_end_btn = make_button(schedule_edit_page, "End",
+                                        schedule_set_r1_end_button_event_cb);
   lv_obj_set_size(schedule_range1_end_btn, 96, 34);
   lv_obj_align(schedule_range1_end_btn, LV_ALIGN_TOP_RIGHT, -14, 92);
 
@@ -1333,8 +1396,8 @@ void setup() {
                   LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
 
   schedule_range1_end_time_label = lv_label_create(schedule_edit_page);
-  lv_obj_set_style_text_color(schedule_range1_end_time_label, lv_color_hex(0xFFFFFF),
-                              LV_PART_MAIN);
+  lv_obj_set_style_text_color(schedule_range1_end_time_label,
+                              lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_align_to(schedule_range1_end_time_label, schedule_range1_end_btn,
                   LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
 
@@ -1409,6 +1472,7 @@ void setup() {
 
   init_fastled();
   gPrevScheduleActive = is_schedule_active_now();
+  gLastTouchMs = millis();
 }
 
 void loop() {
@@ -1435,6 +1499,12 @@ void loop() {
   }
 
   const uint32_t now = millis();
+  if ((now - gLastTouchMs) >= DISPLAY_SLEEP_TIMEOUT_MS) {
+    sleep_display();
+  } else if (gTouchPressed || ((now - gLastTouchMs) < 200U)) {
+    wake_display();
+  }
+
   const bool ui_priority = gTouchPressed || ((now - gLastTouchMs) < 200U);
   if (!ui_priority) {
     run_fastled();
